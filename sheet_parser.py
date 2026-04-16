@@ -17,7 +17,67 @@ from lark_auth import get_user_access_token
 
 LARK_API     = "https://open.larksuite.com/open-apis"
 SHEET_TOKEN  = os.environ.get("LARK_SHEET_TOKEN", "EikqsZWIphkIGTtDxQIl6nSkg4f")
-SHEET_ID     = os.environ.get("LARK_SHEET_ID", "Production")  # tên tab
+_SHEET_ID_ENV = os.environ.get("LARK_SHEET_ID", "")   # có thể là tên tab hoặc sheet ID thực
+
+
+# ── Auto-discover sheet ID từ tên tab ────────────────────────────────────────
+def get_sheet_id() -> str:
+    """
+    Lark Sheet API cần sheetId dạng mã 6-7 ký tự (vd: '0b4f2c'),
+    không phải tên tab (vd: 'Production').
+
+    Hàm này gọi API lấy danh sách tất cả sheets trong spreadsheet,
+    rồi tìm sheet có title khớp với LARK_SHEET_ID.
+    Nếu LARK_SHEET_ID đã là mã (không có khoảng trắng, ngắn) → dùng luôn.
+    """
+    # Nếu đã là mã ngắn (≤12 ký tự, không có space) → dùng luôn
+    if _SHEET_ID_ENV and len(_SHEET_ID_ENV) <= 12 and " " not in _SHEET_ID_ENV:
+        return _SHEET_ID_ENV
+
+    # Gọi API lấy danh sách sheets
+    resp = requests.get(
+        f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/query",
+        headers={"Authorization": f"Bearer {get_user_access_token()}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"Lấy danh sách sheets thất bại: {data}")
+
+    sheets = data.get("data", {}).get("sheets", [])
+
+    # In ra để debug
+    print("[sheet] Danh sách tabs trong spreadsheet:")
+    for s in sheets:
+        print(f"  - title='{s.get('title')}' | sheet_id='{s.get('sheet_id')}'")
+
+    # Tìm theo tên tab
+    target = _SHEET_ID_ENV or "Production"
+    for s in sheets:
+        if s.get("title", "").strip() == target.strip():
+            found_id = s["sheet_id"]
+            print(f"[sheet] Tìm thấy: '{target}' → sheet_id={found_id}")
+            return found_id
+
+    # Không tìm thấy tên khớp → dùng sheet đầu tiên
+    if sheets:
+        fallback = sheets[0]["sheet_id"]
+        print(f"[sheet] ⚠️  Không tìm thấy tab '{target}', dùng sheet đầu tiên: {fallback}")
+        return fallback
+
+    raise RuntimeError("Không tìm thấy sheet nào trong spreadsheet!")
+
+
+# Cache sheet ID để không gọi API nhiều lần
+_sheet_id_cache: str | None = None
+
+def _get_cached_sheet_id() -> str:
+    global _sheet_id_cache
+    if not _sheet_id_cache:
+        _sheet_id_cache = get_sheet_id()
+    return _sheet_id_cache
 
 
 # ── 1. Fetch raw data từ Lark Sheets API ─────────────────────────────────────
@@ -27,7 +87,8 @@ def _auth_headers() -> dict:
 
 def fetch_values(start_row: int, end_row: int) -> list[list]:
     """Lấy giá trị text của từng ô, trả về list of rows."""
-    range_str = f"A{start_row}:BZ{end_row}"
+    sheet_id  = _get_cached_sheet_id()
+    range_str = f"{sheet_id}!A{start_row}:BZ{end_row}"
     resp = requests.get(
         f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/values/{range_str}",
         headers=_auth_headers(),
@@ -43,9 +104,10 @@ def fetch_values(start_row: int, end_row: int) -> list[list]:
 
 def fetch_styles(start_row: int, end_row: int) -> list[list]:
     """Lấy style (background color) của từng ô."""
-    range_str = f"{SHEET_ID}!A{start_row}:BZ{end_row}"
+    sheet_id  = _get_cached_sheet_id()
+    range_str = f"{sheet_id}!A{start_row}:BZ{end_row}"
     resp = requests.get(
-        f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/{SHEET_ID}/styles",
+        f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/{sheet_id}/styles",
         headers=_auth_headers(),
         params={"ranges": range_str},
         timeout=15,
