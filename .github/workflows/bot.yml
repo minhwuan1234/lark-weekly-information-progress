@@ -1,0 +1,37 @@
+name: Lark Weekly Bot
+
+on:
+  schedule:
+    - cron: "0 7 * * 5"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          LARK_APP_ID:         ${{ secrets.LARK_APP_ID }}
+          LARK_APP_SECRET:     ${{ secrets.LARK_APP_SECRET }}
+          LARK_REFRESH_TOKEN:  ${{ secrets.LARK_REFRESH_TOKEN }}
+          LARK_SHEET_TOKEN:    ${{ secrets.LARK_SHEET_TOKEN }}
+          LARK_SHEET_ID:       ${{ secrets.LARK_SHEET_ID }}
+          TARGET_EMAIL:        ${{ secrets.TARGET_EMAIL }}
+          TARGET_USER_ID:      ${{ secrets.TARGET_USER_ID }}
+          GH_PAT:              ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
+        run: python bot.py
