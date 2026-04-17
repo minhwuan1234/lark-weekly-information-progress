@@ -7,7 +7,7 @@ Flow:
   1. GET /task/v2/tasklists                    → danh sách tất cả task list
   2. GET /task/v2/tasklists/{guid}/tasks       → task trong từng list (phân trang)
   3. GET /task/v2/tasks/{guid}/subtasks        → sub-task của từng task
-  4. GET /contact/v3/users/{user_id}           → tên thật của assignee
+  4. Collect tất cả open_id → batch lookup tên 1 lần
   5. Lọc task/sub-task có start hoặc due trong [week_start, week_end]
      Sub-task: nếu không có date riêng thì kế thừa date từ task cha
   6. Xác định status:
@@ -23,7 +23,7 @@ from lark_auth import get_user_access_token, get_app_access_token
 
 LARK_API = "https://open.larksuite.com/open-apis"
 
-# Cache tên user để tránh gọi API lặp lại
+# Cache tên user: {open_id: name}
 _user_name_cache: dict[str, str] = {}
 
 
@@ -103,9 +103,6 @@ def fetch_tasks_in_list(tasklist_guid: str) -> list[dict]:
 # ── 3. Lấy sub-tasks của 1 task ───────────────────────────────────────────────
 
 def fetch_subtasks(task_guid: str) -> list[dict]:
-    """
-    GET /task/v2/tasks/{task_guid}/subtasks
-    """
     all_subtasks = []
     page_token = None
 
@@ -136,66 +133,95 @@ def fetch_subtasks(task_guid: str) -> list[dict]:
     return all_subtasks
 
 
-# ── 4. Lookup tên user từ open_id ─────────────────────────────────────────────
+# ── 4. Preload tên tất cả user bằng batch API ────────────────────────────────
 
-def _get_user_name(user_id: str) -> str:
+def preload_user_names(open_ids: set[str]) -> None:
     """
-    Gọi /contact/v3/users/{user_id} để lấy tên thật.
-    Cache kết quả để tránh gọi lặp.
+    Dùng /contact/v3/users/batch_get_id kết hợp với
+    /contact/v3/users để lấy tên hàng loạt.
+    Thực ra Lark không có batch get user info, nên ta dùng
+    /contact/v3/users với filter[user_ids] hoặc gọi từng người
+    nhưng tất cả trong 1 vòng với app_access_token.
     """
-    if not user_id:
-        return "Unassigned"
-    if user_id in _user_name_cache:
-        return _user_name_cache[user_id]
+    ids_to_fetch = [uid for uid in open_ids if uid and uid not in _user_name_cache]
+    if not ids_to_fetch:
+        return
 
-    try:
-        resp = requests.get(
-            f"{LARK_API}/contact/v3/users/{user_id}",
-            headers={"Authorization": f"Bearer {get_app_access_token()}"},
-            params={"user_id_type": "open_id"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        print(f"[user] Lookup {user_id}: {resp.status_code} | {resp.text}")
-        body = resp.json()
-        if body.get("code") == 0:
-            user_data = body.get("data", {}).get("user", {})
-            name = (
-                user_data.get("name")
-                or user_data.get("en_name")
-                or user_data.get("nickname")
-                or user_id
+    print(f"[user] Preloading {len(ids_to_fetch)} user names...")
+
+    # Lark hỗ trợ list users với user_ids filter (max 100/batch)
+    BATCH = 50
+    for i in range(0, len(ids_to_fetch), BATCH):
+        batch = ids_to_fetch[i:i + BATCH]
+        params = {"user_id_type": "open_id"}
+        for uid in batch:
+            params.setdefault("user_ids", [])
+            if isinstance(params["user_ids"], list):
+                params["user_ids"].append(uid)
+
+        try:
+            resp = requests.get(
+                f"{LARK_API}/contact/v3/users",
+                headers={"Authorization": f"Bearer {get_app_access_token()}"},
+                params=[("user_id_type", "open_id")] + [("user_ids", uid) for uid in batch],
+                timeout=15,
             )
-            _user_name_cache[user_id] = name
-            return name
-    except Exception as e:
-        print(f"[user] ❌ Lỗi lookup {user_id}: {e}")
+            resp.raise_for_status()
+            body = resp.json()
+            print(f"[user] Batch lookup status: {resp.status_code} | code: {body.get('code')} | msg: {body.get('msg')}")
 
-    _user_name_cache[user_id] = user_id  # fallback về id
-    return user_id
+            if body.get("code") == 0:
+                user_list = body.get("data", {}).get("user_list") or body.get("data", {}).get("items", [])
+                for u in user_list:
+                    uid  = u.get("open_id") or u.get("user_id", "")
+                    name = u.get("name") or u.get("en_name") or u.get("nickname") or uid
+                    if uid:
+                        _user_name_cache[uid] = name
+                        print(f"[user] ✅ {uid} → {name}")
+            else:
+                print(f"[user] ⚠️  Batch lookup lỗi: {body}")
+                # Fallback: giữ open_id
+                for uid in batch:
+                    _user_name_cache.setdefault(uid, uid)
+
+        except Exception as e:
+            print(f"[user] ❌ Batch lookup exception: {e}")
+            for uid in batch:
+                _user_name_cache.setdefault(uid, uid)
+
+    # Đảm bảo mọi id đều có trong cache (fallback về id nếu không tìm thấy)
+    for uid in ids_to_fetch:
+        _user_name_cache.setdefault(uid, uid)
 
 
-# ── 5. Lấy assignee (tên thật) ────────────────────────────────────────────────
+# ── 5. Collect tất cả open_id từ raw tasks ───────────────────────────────────
+
+def _collect_open_ids(raw_tasks: list[dict]) -> set[str]:
+    ids = set()
+    for t in raw_tasks:
+        for m in (t.get("members") or []):
+            uid = m.get("id", "")
+            if uid:
+                ids.add(uid)
+    return ids
+
+
+# ── 6. Lấy assignee từ cache ──────────────────────────────────────────────────
 
 def _get_assignees(task: dict) -> str:
     members = task.get("members") or []
-    print(f"[user] Raw members for '{task.get('summary', '')}': {members}")
     names = []
     for m in members:
         if m.get("role") != "assignee":
             continue
-        user_id = m.get("id", "")
-        if user_id:
-            # Luôn lookup qua API để đảm bảo có tên thật
-            name = _get_user_name(user_id)
-        else:
-            name = m.get("name") or m.get("display_name") or ""
+        uid  = m.get("id", "")
+        name = _user_name_cache.get(uid, uid) if uid else ""
         if name:
             names.append(name)
     return ", ".join(filter(None, names)) or "Unassigned"
 
 
-# ── 6. Parse timestamp ────────────────────────────────────────────────────────
+# ── 7. Parse timestamp ────────────────────────────────────────────────────────
 
 def _parse_ts(ts_str: str | None) -> datetime | None:
     if not ts_str:
@@ -211,7 +237,7 @@ def _to_date(ts_str: str | None) -> date | None:
     return dt.date() if dt else None
 
 
-# ── 7. Xác định status ────────────────────────────────────────────────────────
+# ── 8. Xác định status ────────────────────────────────────────────────────────
 
 def _determine_status(task: dict, today: date) -> str:
     completed_at = task.get("completed_at")
@@ -224,7 +250,7 @@ def _determine_status(task: dict, today: date) -> str:
     return "todo"
 
 
-# ── 8. Parse 1 task/sub-task thành dict chuẩn ────────────────────────────────
+# ── 9. Parse 1 task/sub-task thành dict chuẩn ────────────────────────────────
 
 def _parse_task(
     t: dict,
@@ -260,19 +286,19 @@ def _parse_task(
     }
 
 
-# ── 9. Core: lấy tất cả tasks + sub-tasks trong tuần ─────────────────────────
+# ── 10. Core: lấy tất cả tasks + sub-tasks trong tuần ────────────────────────
 
 def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
     """
     Lấy tất cả tasks VÀ sub-tasks có start_date hoặc due_date
     trong [week_start, week_end].
-
-    Sub-task không có date riêng sẽ kế thừa date từ task cha
-    → luôn hiện cùng task cha nếu task cha trong tuần.
     """
     today     = date.today()
     tasklists = fetch_tasklists()
-    result    = []
+
+    # Pass 1: thu thập tất cả raw tasks + subtasks
+    all_raw: list[tuple[dict, str, str | None, date | None, date | None]] = []
+    # (task, tl_name, parent_name, fallback_due, fallback_start)
 
     def _in_week(d: date | None) -> bool:
         return bool(d and week_start <= d <= week_end)
@@ -287,38 +313,40 @@ def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
         print(f"[task] '{tl_name}': {len(raw_tasks)} tasks")
 
         for t in raw_tasks:
-            task_name  = t.get("summary", "(no name)")
-            task_guid  = t.get("guid", "")
-            due_d      = _to_date((t.get("due") or {}).get("timestamp"))
-            start_d    = _to_date((t.get("start") or {}).get("timestamp"))
+            task_name      = t.get("summary", "(no name)")
+            task_guid      = t.get("guid", "")
+            due_d          = _to_date((t.get("due") or {}).get("timestamp"))
+            start_d        = _to_date((t.get("start") or {}).get("timestamp"))
             parent_in_week = _in_week(due_d) or _in_week(start_d)
 
-            # ── Task cha ──────────────────────────────────────────────────
             if parent_in_week:
-                result.append(_parse_task(t, today, tl_name, parent_name=None))
+                all_raw.append((t, tl_name, None, None, None))
 
-            # ── Sub-tasks ─────────────────────────────────────────────────
             if task_guid:
                 subtasks = fetch_subtasks(task_guid)
                 for st in subtasks:
-                    st_due   = _to_date((st.get("due") or {}).get("timestamp"))
-                    st_start = _to_date((st.get("start") or {}).get("timestamp"))
+                    st_due     = _to_date((st.get("due") or {}).get("timestamp"))
+                    st_start   = _to_date((st.get("start") or {}).get("timestamp"))
                     st_in_week = _in_week(st_due) or _in_week(st_start)
-
-                    # Hiện sub-task nếu:
-                    # (a) sub-task có date riêng trong tuần, HOẶC
-                    # (b) task cha trong tuần (sub-task kế thừa context cha)
                     if st_in_week or parent_in_week:
-                        parsed = _parse_task(
-                            st, today, tl_name,
-                            parent_name=task_name,
-                            fallback_due=due_d,       # kế thừa due cha nếu không có
-                            fallback_start=start_d,   # kế thừa start cha nếu không có
-                        )
-                        result.append(parsed)
-                        print(f"[task]   └─ Sub-task: {st.get('summary', '')} | status={parsed['status']}")
+                        all_raw.append((st, tl_name, task_name, due_d, start_d))
 
-    # Sắp xếp: overdue trước, rồi in_progress, todo, done
+    # Pass 2: collect tất cả open_id → preload tên 1 lần
+    all_ids: set[str] = set()
+    for (t, *_) in all_raw:
+        all_ids |= _collect_open_ids([t])
+
+    preload_user_names(all_ids)
+
+    # Pass 3: parse thành dict chuẩn (dùng cache đã có)
+    result = []
+    for (t, tl_name, parent_name, fallback_due, fallback_start) in all_raw:
+        parsed = _parse_task(t, today, tl_name, parent_name, fallback_due, fallback_start)
+        result.append(parsed)
+        if parent_name:
+            print(f"[task]   └─ Sub-task: {t.get('summary', '')} | status={parsed['status']}")
+
+    # Sắp xếp: overdue → in_progress → todo → done
     order = {"overdue": 0, "in_progress": 1, "todo": 2, "done": 3}
     result.sort(key=lambda t: (order.get(t["status"], 9), t["due_date"] or date.max))
 
