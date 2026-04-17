@@ -6,12 +6,14 @@ Flow:
   1. Lấy tất cả task list của user
   2. Tìm tasks có start_date hoặc due_date trong tuần này
   3. Xác định status: done / overdue / in_progress / todo
-  4. Lookup open_id từ email (dùng app_access_token)
-  5. Build Lark Card và gửi bằng app_access_token (as bot)
+  4. Lookup open_id từ nhiều email (dùng app_access_token)
+  5. Build Lark Card và gửi cho tất cả recipients
 
 Ghi chú token:
   - Toàn bộ dùng app_access_token (tenant-level)
   - Scope cần có: contact:user.id:readonly, im:message:send_as_bot
+  - TARGET_EMAIL: nhiều email cách nhau dấu phẩy (vd: a@x.com,b@x.com)
+  - TARGET_USER_ID: nhiều open_id cách nhau dấu phẩy
 """
 
 import os
@@ -33,10 +35,12 @@ def get_week_range() -> tuple[date, date]:
     return monday, friday
 
 
-def get_open_id_by_email(email: str) -> str:
+def get_open_ids_by_emails(emails: list[str]) -> dict[str, str]:
     """
-    Dùng /contact/v3/users/batch_get_id để lấy open_id từ email.
+    Dùng /contact/v3/users/batch_get_id để lấy open_id từ danh sách email.
+    Gửi batch 1 lần thay vì gọi API từng email.
     Yêu cầu scope: contact:user.id:readonly
+    Trả về: {email: open_id} cho các email tìm thấy.
     """
     resp = requests.post(
         f"{LARK_API}/contact/v3/users/batch_get_id",
@@ -45,7 +49,7 @@ def get_open_id_by_email(email: str) -> str:
             "Content-Type": "application/json",
         },
         params={"user_id_type": "open_id"},
-        json={"emails": [email]},
+        json={"emails": emails},
         timeout=15,
     )
     print(f"[bot] Lookup status: {resp.status_code}")
@@ -56,25 +60,29 @@ def get_open_id_by_email(email: str) -> str:
     if body.get("code") != 0:
         raise RuntimeError(f"[bot] Lookup open_id thất bại: {body}")
 
+    result: dict[str, str] = {}
     user_list = body.get("data", {}).get("user_list", [])
-    if not user_list or not user_list[0].get("user_id"):
-        raise ValueError(f"[bot] Không tìm thấy open_id cho email: {email}")
+    for user in user_list:
+        email   = user.get("email", "")
+        user_id = user.get("user_id", "")
+        if email and user_id:
+            result[email] = user_id
+            print(f"[bot] 🔍 Resolved {email} → open_id={user_id}")
+        else:
+            print(f"[bot] ⚠️  Không tìm thấy open_id cho email: {email or '(unknown)'}")
 
-    open_id = user_list[0]["user_id"]
-    print(f"[bot] 🔍 Resolved {email} → open_id={open_id}")
-    return open_id
+    return result
 
 
 def send_message(receive_id: str, receive_id_type: str, card: dict) -> None:
     """
     Gửi Lark Interactive Card dưới danh nghĩa bot.
     Dùng app_access_token — yêu cầu scope: im:message:send_as_bot
-    receive_id_type: "open_id" | "user_id" | "union_id" | "chat_id"
     """
     resp = requests.post(
         f"{LARK_API}/im/v1/messages",
         headers={
-            "Authorization": f"Bearer {get_app_access_token()}",  # ← app token (send as bot)
+            "Authorization": f"Bearer {get_app_access_token()}",
             "Content-Type": "application/json",
         },
         params={"receive_id_type": receive_id_type},
@@ -112,22 +120,35 @@ def main():
     # Bước 2: Build Lark Card
     card = build_weekly_report_card(tasks, week_start, week_end)
 
-    # Bước 3: Xác định open_id để gửi tin
-    target_email   = os.environ.get("TARGET_EMAIL", "").strip()
-    target_user_id = os.environ.get("TARGET_USER_ID", "").strip()
+    # Bước 3: Xác định danh sách open_id để gửi tin
+    target_emails   = [e.strip() for e in os.environ.get("TARGET_EMAIL", "").split(",") if e.strip()]
+    target_user_ids = [u.strip() for u in os.environ.get("TARGET_USER_ID", "").split(",") if u.strip()]
 
-    if target_user_id:
-        # Ưu tiên dùng open_id có sẵn — không cần lookup
-        open_id = target_user_id
-        print(f"[bot] Dùng TARGET_USER_ID trực tiếp: {open_id}")
-    elif target_email:
-        # Lookup open_id từ email
-        open_id = get_open_id_by_email(target_email)
-    else:
-        raise ValueError("Cần set TARGET_EMAIL hoặc TARGET_USER_ID trong GitHub Secrets")
+    open_ids: list[str] = []
 
-    # Bước 4: Gửi tin bằng app_access_token (as bot)
-    send_message(open_id, "open_id", card)
+    # Ưu tiên TARGET_USER_ID nếu có
+    if target_user_ids:
+        open_ids.extend(target_user_ids)
+        print(f"[bot] Dùng TARGET_USER_ID: {target_user_ids}")
+
+    # Lookup open_id từ email (batch 1 lần)
+    if target_emails:
+        print(f"[bot] Lookup {len(target_emails)} email(s)...")
+        resolved = get_open_ids_by_emails(target_emails)
+        open_ids.extend(resolved.values())
+
+        # Cảnh báo email nào không tìm thấy
+        missing = [e for e in target_emails if e not in resolved]
+        for e in missing:
+            print(f"[bot] ⚠️  Bỏ qua — không tìm thấy open_id cho: {e}")
+
+    if not open_ids:
+        raise ValueError("Không có recipient hợp lệ — kiểm tra lại TARGET_EMAIL hoặc TARGET_USER_ID")
+
+    # Bước 4: Gửi tin cho tất cả recipients
+    print(f"[bot] Gửi tin cho {len(open_ids)} người...")
+    for open_id in open_ids:
+        send_message(open_id, "open_id", card)
 
     print("[bot] ✅ Hoàn thành!")
     print("=" * 60)
