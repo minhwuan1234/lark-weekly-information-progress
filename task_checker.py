@@ -179,6 +179,7 @@ def _get_user_name(user_id: str) -> str:
 
 def _get_assignees(task: dict) -> str:
     members = task.get("members") or []
+    print(f"[user] Raw members for '{task.get('summary', '')}': {members}")
     names = []
     for m in members:
         if m.get("role") != "assignee":
