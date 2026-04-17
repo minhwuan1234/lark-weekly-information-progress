@@ -49,6 +49,9 @@ def get_open_id_by_email(email: str) -> str:
         json={"emails": [email]},
         timeout=15,
     )
+
+    print(f"[bot] Response status: {resp.status_code}")
+    print(f"[bot] Response body: {resp.text}")
     resp.raise_for_status()
     body = resp.json()
 
