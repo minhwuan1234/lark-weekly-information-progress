@@ -51,7 +51,10 @@ def get_app_access_token() -> str:
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()["app_access_token"]
+    data = resp.json()
+    if data.get("code") != 0 or "app_access_token" not in data:
+        raise RuntimeError(f"❌ Lấy app_access_token thất bại: {data.get('msg', data)}")
+    return data["app_access_token"]
 
 
 def exchange_code_for_tokens(code: str, app_token: str) -> dict:
