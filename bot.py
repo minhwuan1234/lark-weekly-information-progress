@@ -3,11 +3,15 @@ bot.py
 Entry point của Lark Weekly Bot.
 Chạy mỗi chiều thứ 6 qua GitHub Actions.
 
-Flow mới (không còn dùng sheet):
+Flow:
   1. Lấy tất cả task list của user
   2. Tìm tasks có start_date hoặc due_date trong tuần này
   3. Xác định status: done / overdue / in_progress / todo
-  4. Build Lark Card và gửi
+  4. Build Lark Card và gửi thẳng bằng email (không cần lookup open_id)
+
+Ghi chú gửi tin:
+  - Dùng receive_id_type="email" → gửi thẳng bằng email, không cần contact API
+  - Fallback: nếu có TARGET_USER_ID (open_id) thì dùng open_id
 """
 
 import os
@@ -30,45 +34,20 @@ def get_week_range() -> tuple[date, date]:
     return monday, friday
 
 
-def get_user_id_by_email(email: str) -> str:
-    resp = requests.post(
-        f"{LARK_API}/contact/v3/users/batch_get_id",
-        headers={
-            "Authorization": f"Bearer {get_app_access_token()}",
-            "Content-Type": "application/json",
-        },
-        params={"user_id_type": "open_id"},
-        json={"emails": [email]},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-
-    if body.get("code") != 0:
-        raise RuntimeError(f"Lookup user by email thất bại: {body}")
-
-    user_list = body.get("data", {}).get("user_list", [])
-    if not user_list:
-        raise ValueError(f"Không tìm thấy user với email: {email}")
-
-    user_id = user_list[0].get("user_id")
-    if not user_id:
-        raise ValueError(f"Email {email} chưa được liên kết với tài khoản Lark nào.")
-
-    print(f"[bot] Tìm thấy user_id={user_id} cho email={email}")
-    return user_id
-
-
-def send_message(user_id: str, card: dict) -> None:
+def send_message(receive_id: str, receive_id_type: str, card: dict) -> None:
+    """
+    Gửi Lark Interactive Card.
+    receive_id_type: "email" | "open_id" | "user_id" | "union_id" | "chat_id"
+    """
     resp = requests.post(
         f"{LARK_API}/im/v1/messages",
         headers={
             "Authorization": f"Bearer {get_app_access_token()}",
             "Content-Type": "application/json",
         },
-        params={"receive_id_type": "open_id"},
+        params={"receive_id_type": receive_id_type},
         json={
-            "receive_id": user_id,
+            "receive_id": receive_id,
             "msg_type":   "interactive",
             "content":    json.dumps(card),
         },
@@ -78,7 +57,7 @@ def send_message(user_id: str, card: dict) -> None:
     body = resp.json()
     if body.get("code") != 0:
         raise RuntimeError(f"Gửi tin nhắn thất bại: {body}")
-    print(f"[bot] ✅ Đã gửi báo cáo tới user_id={user_id}")
+    print(f"[bot] ✅ Đã gửi báo cáo tới {receive_id_type}={receive_id}")
 
 
 def main():
@@ -98,14 +77,17 @@ def main():
     # Bước 2: Build Lark Card
     card = build_weekly_report_card(tasks, week_start, week_end)
 
-    # Bước 3: Resolve user_id rồi gửi
-    target_email = os.environ.get("TARGET_EMAIL")
-    if target_email:
-        target_user_id = get_user_id_by_email(target_email)
-    else:
-        target_user_id = os.environ["TARGET_USER_ID"]
+    # Bước 3: Gửi tin — ưu tiên email (không cần lookup open_id)
+    target_email   = os.environ.get("TARGET_EMAIL", "").strip()
+    target_user_id = os.environ.get("TARGET_USER_ID", "").strip()
 
-    send_message(target_user_id, card)
+    if target_email:
+        # Gửi thẳng bằng email — Lark hỗ trợ receive_id_type=email
+        send_message(target_email, "email", card)
+    elif target_user_id:
+        send_message(target_user_id, "open_id", card)
+    else:
+        raise ValueError("Cần set TARGET_EMAIL hoặc TARGET_USER_ID trong GitHub Secrets")
 
     print("[bot] ✅ Hoàn thành!")
     print("=" * 60)
