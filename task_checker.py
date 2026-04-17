@@ -103,23 +103,32 @@ def fetch_tasks_in_list(tasklist_guid: str) -> list[dict]:
 # ── 3. Lấy sub-tasks của 1 task ───────────────────────────────────────────────
 
 def fetch_subtasks(task_guid: str) -> list[dict]:
+    import time
     all_subtasks = []
     page_token = None
+    max_retries = 3
 
     while True:
         params: dict = {"page_size": 50}
         if page_token:
             params["page_token"] = page_token
 
-        resp = requests.get(
-            f"{LARK_API}/task/v2/tasks/{task_guid}/subtasks",
-            headers=_auth_headers(),
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+        for attempt in range(max_retries):
+            resp = requests.get(
+                f"{LARK_API}/task/v2/tasks/{task_guid}/subtasks",
+                headers=_auth_headers(),
+                params=params,
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"[task] ⏳ Rate limit subtasks, chờ {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
 
+        body = resp.json()
         if body.get("code") != 0:
             break
 
@@ -129,6 +138,8 @@ def fetch_subtasks(task_guid: str) -> list[dict]:
         page_token = data.get("page_token")
         if not data.get("has_more") or not page_token:
             break
+
+        time.sleep(0.2)  # throttle nhẹ giữa các page
 
     return all_subtasks
 
