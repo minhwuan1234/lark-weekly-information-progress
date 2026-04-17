@@ -137,61 +137,37 @@ def fetch_subtasks(task_guid: str) -> list[dict]:
 
 def preload_user_names(open_ids: set[str]) -> None:
     """
-    Dùng /contact/v3/users/batch_get_id kết hợp với
-    /contact/v3/users để lấy tên hàng loạt.
-    Thực ra Lark không có batch get user info, nên ta dùng
-    /contact/v3/users với filter[user_ids] hoặc gọi từng người
-    nhưng tất cả trong 1 vòng với app_access_token.
+    Gọi /contact/v3/users/{open_id} từng người bằng user_access_token.
+    user_access_token đã có quyền đọc thông tin user trong workspace.
+    Cache kết quả để mỗi user chỉ gọi 1 lần.
     """
     ids_to_fetch = [uid for uid in open_ids if uid and uid not in _user_name_cache]
     if not ids_to_fetch:
         return
 
     print(f"[user] Preloading {len(ids_to_fetch)} user names...")
+    token = get_user_access_token()
 
-    # Lark hỗ trợ list users với user_ids filter (max 100/batch)
-    BATCH = 50
-    for i in range(0, len(ids_to_fetch), BATCH):
-        batch = ids_to_fetch[i:i + BATCH]
-        params = {"user_id_type": "open_id"}
-        for uid in batch:
-            params.setdefault("user_ids", [])
-            if isinstance(params["user_ids"], list):
-                params["user_ids"].append(uid)
-
+    for uid in ids_to_fetch:
         try:
             resp = requests.get(
-                f"{LARK_API}/contact/v3/users",
-                headers={"Authorization": f"Bearer {get_user_access_token()}"},
-                params=[("user_id_type", "open_id")] + [("user_ids", uid) for uid in batch],
-                timeout=15,
+                f"{LARK_API}/contact/v3/users/{uid}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"user_id_type": "open_id"},
+                timeout=10,
             )
-            resp.raise_for_status()
             body = resp.json()
-            print(f"[user] Batch lookup status: {resp.status_code} | code: {body.get('code')} | msg: {body.get('msg')}")
-
             if body.get("code") == 0:
-                user_list = body.get("data", {}).get("user_list") or body.get("data", {}).get("items", [])
-                for u in user_list:
-                    uid  = u.get("open_id") or u.get("user_id", "")
-                    name = u.get("name") or u.get("en_name") or u.get("nickname") or uid
-                    if uid:
-                        _user_name_cache[uid] = name
-                        print(f"[user] ✅ {uid} → {name}")
+                u    = body.get("data", {}).get("user", {})
+                name = u.get("name") or u.get("en_name") or u.get("nickname") or uid
+                _user_name_cache[uid] = name
+                print(f"[user] ✅ {uid} → {name}")
             else:
-                print(f"[user] ⚠️  Batch lookup lỗi: {body}")
-                # Fallback: giữ open_id
-                for uid in batch:
-                    _user_name_cache.setdefault(uid, uid)
-
+                print(f"[user] ⚠️  {uid}: code={body.get('code')} msg={body.get('msg')}")
+                _user_name_cache[uid] = uid
         except Exception as e:
-            print(f"[user] ❌ Batch lookup exception: {e}")
-            for uid in batch:
-                _user_name_cache.setdefault(uid, uid)
-
-    # Đảm bảo mọi id đều có trong cache (fallback về id nếu không tìm thấy)
-    for uid in ids_to_fetch:
-        _user_name_cache.setdefault(uid, uid)
+            print(f"[user] ❌ {uid}: {e}")
+            _user_name_cache[uid] = uid
 
 
 # ── 5. Collect tất cả open_id từ raw tasks ───────────────────────────────────
