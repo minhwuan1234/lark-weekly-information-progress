@@ -49,6 +49,19 @@ def fetch_tasklists() -> list[dict]:
             timeout=15,
         )
         resp.raise_for_status()
+        def _get_user_name(user_id: str) -> str:
+    ...
+    try:
+        resp = requests.get(
+            f"{LARK_API}/contact/v3/users/{user_id}",
+            headers={"Authorization": f"Bearer {get_app_access_token()}"},
+            params={"user_id_type": "open_id"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        print(f"[user] Lookup {user_id}: {resp.status_code} | {resp.text}")  # ← thêm vào đây
+        body = resp.json()
+        ...
         body = resp.json()
 
         if body.get("code") != 0:
