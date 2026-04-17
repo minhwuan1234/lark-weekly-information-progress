@@ -168,8 +168,8 @@ def _get_user_name(user_id: str) -> str:
             )
             _user_name_cache[user_id] = name
             return name
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[user] ❌ Lỗi lookup {user_id}: {e}")
 
     _user_name_cache[user_id] = user_id  # fallback về id
     return user_id
