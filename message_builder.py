@@ -1,29 +1,17 @@
 """
 message_builder.py
-Tạo Lark Interactive Card đẹp, nhóm task theo assignee.
-Mỗi assignee có màu riêng. Status hiển thị bằng badge màu.
+Tạo Lark Interactive Card từ danh sách tasks trong tuần.
+Nhóm theo tasklist name, hiển thị status bằng icon + màu.
 """
 
 from datetime import date
 
 
-# Màu đại diện cho từng assignee (tự động assign theo thứ tự xuất hiện)
-ASSIGNEE_COLORS = [
-    "#2D7EFF",   # blue
-    "#7B61FF",   # purple
-    "#00B0A6",   # teal
-    "#FF6B2B",   # orange
-    "#E8283C",   # red
-    "#00875A",   # green
-    "#FF8B00",   # amber
-    "#FF4F9B",   # pink
-]
-
 STATUS_CONFIG = {
-    "done":        {"label": "Done",        "color": "#00B0A6"},
-    "in_progress": {"label": "In progress", "color": "#FF8B00"},
-    "todo":        {"label": "To do",       "color": "#888888"},
-    "not_found":   {"label": "Not found",   "color": "#CCCCCC"},
+    "done":        {"icon": "✅", "label": "Done",        "color": "#00B0A6"},
+    "overdue":     {"icon": "🔴", "label": "Overdue",     "color": "#E8283C"},
+    "in_progress": {"icon": "🟡", "label": "In progress", "color": "#FF8B00"},
+    "todo":        {"icon": "⚪", "label": "To do",       "color": "#888888"},
 }
 
 
@@ -34,118 +22,134 @@ def build_weekly_report_card(
 ) -> dict:
     """
     Tạo Lark Interactive Card JSON.
-    https://open.larksuite.com/document/ukTMukTMukTM/uAjNwUjLwYDM14CM2ATN
+    tasks[i] chứa: name, status, due_date, start_date, assignee,
+                   tasklist_name, task_url, completed_at
     """
-    # Nhóm task theo assignee
-    assignees: dict[str, list[dict]] = {}
-    for t in tasks:
-        name = t.get("assignee") or "Unknown"
-        assignees.setdefault(name, []).append(t)
-
-    # Map assignee → màu
-    color_map: dict[str, str] = {}
-    for i, name in enumerate(assignees):
-        color_map[name] = ASSIGNEE_COLORS[i % len(ASSIGNEE_COLORS)]
-
-    # Tổng hợp số liệu
     total       = len(tasks)
-    done_count  = sum(1 for t in tasks if t.get("status") == "done")
-    wip_count   = sum(1 for t in tasks if t.get("status") == "in_progress")
-    todo_count  = sum(1 for t in tasks if t.get("status") in ("todo", "not_found"))
+    done_count  = sum(1 for t in tasks if t["status"] == "done")
+    overdue_count = sum(1 for t in tasks if t["status"] == "overdue")
+    wip_count   = sum(1 for t in tasks if t["status"] == "in_progress")
+    todo_count  = sum(1 for t in tasks if t["status"] == "todo")
+
+    # Nhóm theo tasklist
+    by_list: dict[str, list[dict]] = {}
+    for t in tasks:
+        key = t.get("tasklist_name") or "Other"
+        by_list.setdefault(key, []).append(t)
 
     # ── Header ───────────────────────────────────────────────────────────────
     header = {
         "template": "blue",
         "title": {
-            "tag": "plain_text",
-            "content": f"📋  Weekly Report  {week_start.strftime('%d/%m')} – {week_end.strftime('%d/%m/%Y')}",
+            "tag":     "plain_text",
+            "content": f"📋 Weekly Task Review  {week_start.strftime('%d/%m')} – {week_end.strftime('%d/%m/%Y')}",
         },
     }
 
     elements: list[dict] = []
 
-    # ── Summary stats ────────────────────────────────────────────────────────
+    # ── Summary stats ─────────────────────────────────────────────────────────
     elements.append({
         "tag": "column_set",
         "flex_mode": "stretch",
         "columns": [
-            _stat_col("Total", str(total),       "#2D7EFF"),
-            _stat_col("Done",  str(done_count),  "#00B0A6"),
-            _stat_col("WIP",   str(wip_count),   "#FF8B00"),
-            _stat_col("To do", str(todo_count),  "#888888"),
+            _stat_col("Total",       str(total),         "#2D7EFF"),
+            _stat_col("✅ Done",     str(done_count),    "#00B0A6"),
+            _stat_col("🔴 Overdue",  str(overdue_count), "#E8283C"),
+            _stat_col("🟡 In prog",  str(wip_count),     "#FF8B00"),
+            _stat_col("⚪ To do",    str(todo_count),    "#888888"),
         ],
     })
 
     elements.append({"tag": "hr"})
 
-    # ── Mỗi assignee 1 section ───────────────────────────────────────────────
-    for assignee, a_tasks in assignees.items():
-        color = color_map[assignee]
-
-        # Header assignee
+    # ── Cảnh báo nếu có task overdue ─────────────────────────────────────────
+    if overdue_count > 0:
         elements.append({
             "tag": "markdown",
-            "content": f"**<font color='{color}'>{assignee}</font>**  "
-                       f"`{len(a_tasks)} task{'s' if len(a_tasks) > 1 else ''}`",
+            "content": f"⚠️ **{overdue_count} task đã quá deadline** — cần follow up ngay!",
+        })
+        elements.append({"tag": "hr"})
+
+    # ── Từng task list ────────────────────────────────────────────────────────
+    for list_name, list_tasks in by_list.items():
+        # Tiêu đề task list
+        elements.append({
+            "tag": "markdown",
+            "content": f"**📁 {list_name}**  `{len(list_tasks)} task{'s' if len(list_tasks) > 1 else ''}`",
         })
 
-        # Từng task
-        for t in a_tasks:
-            status_cfg = STATUS_CONFIG.get(t.get("status", "todo"), STATUS_CONFIG["todo"])
-            due_text   = f"  ·  Due {t['due']}" if t.get("due") else ""
-            name       = t.get("name") or "(no name)"
+        # Từng task trong list
+        for t in list_tasks:
+            cfg      = STATUS_CONFIG.get(t["status"], STATUS_CONFIG["todo"])
+            name     = t.get("name") or "(no name)"
+            if len(name) > 65:
+                name = name[:62] + "..."
 
-            # Truncate tên dài
-            if len(name) > 60:
-                name = name[:57] + "..."
+            # Dòng phụ: assignee + due date
+            meta_parts = []
+            if t.get("assignee") and t["assignee"] != "Unassigned":
+                meta_parts.append(f"👤 {t['assignee']}")
+            if t.get("due_date"):
+                due_str = t["due_date"].strftime("%d/%m")
+                if t["status"] == "overdue":
+                    meta_parts.append(f"⏰ Due {due_str} (quá hạn)")
+                else:
+                    meta_parts.append(f"📅 Due {due_str}")
+            if t.get("completed_at"):
+                meta_parts.append(f"✓ Completed {t['completed_at'].strftime('%d/%m')}")
+
+            meta_line = "  ·  ".join(meta_parts)
+
+            # Build task row: có link nếu có task_url
+            task_url = t.get("task_url", "")
+            if task_url:
+                name_md = f"[{name}]({task_url})"
+            else:
+                name_md = name
+
+            task_md = (
+                f"<font color='{cfg['color']}'>{cfg['icon']} **{cfg['label']}**</font>"
+                f"  {name_md}"
+            )
+            if meta_line:
+                task_md += f"\n<font color='#999999'>{meta_line}</font>"
 
             elements.append({
-                "tag": "markdown",
-                "content": (
-                    f"<font color='{status_cfg['color']}'>"
-                    f"● {status_cfg['label']}"
-                    f"</font>  "
-                    f"{name}"
-                    f"<font color='#999999'>{due_text}</font>"
-                ),
+                "tag":     "markdown",
+                "content": task_md,
             })
 
         elements.append({"tag": "hr"})
 
-    # Xóa hr cuối cùng
+    # Xoá hr cuối
     if elements and elements[-1].get("tag") == "hr":
         elements.pop()
 
-    # ── Footer ───────────────────────────────────────────────────────────────
+    # ── Footer ────────────────────────────────────────────────────────────────
     elements.append({
         "tag": "note",
         "elements": [{
-            "tag": "plain_text",
-            "content": f"Generated by Lark Weekly Bot · {date.today().strftime('%A, %d %b %Y')}",
+            "tag":     "plain_text",
+            "content": f"Lark Weekly Bot · {date.today().strftime('%A, %d %b %Y')}",
         }],
     })
 
     return {
-        "msg_type": "interactive",
-        "card": {
-            "header":   header,
-            "elements": elements,
-        },
+        "header":   header,
+        "elements": elements,
     }
 
 
 def _stat_col(label: str, value: str, color: str) -> dict:
-    """Tạo 1 cột stat nhỏ trong summary row."""
     return {
         "tag": "column",
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": (
-                    f"<font color='{color}'>**{value}**</font>\n"
-                    f"<font color='#999999'>{label}</font>"
-                ),
-                "text_align": "center",
-            }
-        ],
+        "elements": [{
+            "tag":       "markdown",
+            "content":   (
+                f"<font color='{color}'>**{value}**</font>\n"
+                f"<font color='#999999'>{label}</font>"
+            ),
+            "text_align": "center",
+        }],
     }
