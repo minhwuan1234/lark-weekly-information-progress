@@ -32,16 +32,16 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {get_user_access_token()}"}
 
 
-def _get(url: str, headers: dict, params: dict = None, max_retries: int = 5) -> requests.Response:
+def _get(url: str, headers: dict, params: dict = None, max_retries: int = 6) -> requests.Response:
     """
     Wrapper GET với retry tự động khi gặp 429 Too Many Requests.
-    Exponential backoff: 1s → 2s → 4s → 8s → 16s
+    Exponential backoff: 2s → 4s → 8s → 16s → 32s → 60s
     """
     for attempt in range(max_retries):
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code != 429:
             return resp
-        wait = 2 ** attempt
+        wait = min(2 ** (attempt + 1), 60)  # cap tối đa 60s
         print(f"[api] ⏳ Rate limit 429, chờ {wait}s (attempt {attempt+1}/{max_retries})...")
         time.sleep(wait)
     # Lần cuối raise luôn
@@ -288,6 +288,7 @@ def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
         if not tl_guid:
             continue
 
+        time.sleep(0.5)  # throttle giữa các tasklist
         raw_tasks = fetch_tasks_in_list(tl_guid)
         print(f"[task] '{tl_name}': {len(raw_tasks)} tasks")
 
@@ -302,6 +303,7 @@ def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
                 all_raw.append((t, tl_name, None, None, None))
 
             if task_guid:
+                time.sleep(0.3)  # throttle trước khi fetch subtasks
                 subtasks = fetch_subtasks(task_guid)
                 for st in subtasks:
                     st_due     = _to_date((st.get("due") or {}).get("timestamp"))
