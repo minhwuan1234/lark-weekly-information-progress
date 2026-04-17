@@ -6,20 +6,19 @@ Flow:
   1. Lấy tất cả task list của user
   2. Tìm tasks có start_date hoặc due_date trong tuần này
   3. Xác định status: done / overdue / in_progress / todo
-  4. Lookup open_id từ email (dùng contact/v3/users/batch_get_id)
-  5. Build Lark Card và gửi bằng open_id
+  4. Lookup open_id từ email (dùng app_access_token)
+  5. Build Lark Card và gửi bằng user_access_token + open_id
 
-Ghi chú gửi tin:
-  - Dùng receive_id_type="open_id" → cần lookup open_id từ email trước
-  - Fallback: nếu có TARGET_USER_ID (open_id) thì dùng thẳng, bỏ qua bước lookup
-  - Yêu cầu scope Lark App: contact:user.id:readonly
+Ghi chú token:
+  - get_open_id_by_email → dùng app_access_token (tenant-level)
+  - send_message         → dùng user_access_token (user-level, cần để gửi DM)
 """
 
 import os
 import json
 import requests
 from datetime import date, timedelta
-from lark_auth import get_app_access_token
+from lark_auth import get_app_access_token, get_user_access_token
 from task_checker import get_tasks_for_week
 from message_builder import build_weekly_report_card
 
@@ -37,7 +36,7 @@ def get_week_range() -> tuple[date, date]:
 def get_open_id_by_email(email: str) -> str:
     """
     Dùng /contact/v3/users/batch_get_id để lấy open_id từ email.
-    Yêu cầu scope Lark App: contact:user.id:readonly
+    Dùng app_access_token — yêu cầu scope: contact:user.id:readonly
     """
     resp = requests.post(
         f"{LARK_API}/contact/v3/users/batch_get_id",
@@ -49,9 +48,8 @@ def get_open_id_by_email(email: str) -> str:
         json={"emails": [email]},
         timeout=15,
     )
-
-    print(f"[bot] Response status: {resp.status_code}")
-    print(f"[bot] Response body: {resp.text}")
+    print(f"[bot] Lookup status: {resp.status_code}")
+    print(f"[bot] Lookup body: {resp.text}")
     resp.raise_for_status()
     body = resp.json()
 
@@ -70,12 +68,13 @@ def get_open_id_by_email(email: str) -> str:
 def send_message(receive_id: str, receive_id_type: str, card: dict) -> None:
     """
     Gửi Lark Interactive Card.
+    Dùng user_access_token — bắt buộc khi gửi DM tới user cụ thể.
     receive_id_type: "open_id" | "user_id" | "union_id" | "chat_id"
     """
     resp = requests.post(
         f"{LARK_API}/im/v1/messages",
         headers={
-            "Authorization": f"Bearer {get_app_access_token()}",
+            "Authorization": f"Bearer {get_user_access_token()}",  # ← user token
             "Content-Type": "application/json",
         },
         params={"receive_id_type": receive_id_type},
@@ -86,6 +85,8 @@ def send_message(receive_id: str, receive_id_type: str, card: dict) -> None:
         },
         timeout=15,
     )
+    print(f"[bot] Send status: {resp.status_code}")
+    print(f"[bot] Send body: {resp.text}")
     resp.raise_for_status()
     body = resp.json()
 
@@ -116,16 +117,14 @@ def main():
     target_user_id = os.environ.get("TARGET_USER_ID", "").strip()
 
     if target_user_id:
-        # Ưu tiên dùng open_id có sẵn — không cần lookup
         open_id = target_user_id
         print(f"[bot] Dùng TARGET_USER_ID trực tiếp: {open_id}")
     elif target_email:
-        # Lookup open_id từ email — cần scope: contact:user.id:readonly
         open_id = get_open_id_by_email(target_email)
     else:
         raise ValueError("Cần set TARGET_EMAIL hoặc TARGET_USER_ID trong GitHub Secrets")
 
-    # Bước 4: Gửi tin
+    # Bước 4: Gửi tin bằng user_access_token
     send_message(open_id, "open_id", card)
 
     print("[bot] ✅ Hoàn thành!")
