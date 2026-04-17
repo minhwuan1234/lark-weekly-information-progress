@@ -37,4 +37,4 @@ jobs:
           TARGET_USER_ID:     ${{ secrets.TARGET_USER_ID }}
           GH_PAT:             ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
-        run: python bot.py        run: python bot.py
+        run: python bot.py        
