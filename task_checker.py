@@ -182,11 +182,12 @@ def _get_assignees(task: dict) -> str:
     for m in members:
         if m.get("role") != "assignee":
             continue
-        # Ưu tiên name có sẵn trong response, nếu không thì lookup
-        name = m.get("name") or m.get("display_name")
-        if not name:
-            user_id = m.get("id", "")
-            name = _get_user_name(user_id) if user_id else ""
+        user_id = m.get("id", "")
+        if user_id:
+            # Luôn lookup qua API để đảm bảo có tên thật
+            name = _get_user_name(user_id)
+        else:
+            name = m.get("name") or m.get("display_name") or ""
         if name:
             names.append(name)
     return ", ".join(filter(None, names)) or "Unassigned"
