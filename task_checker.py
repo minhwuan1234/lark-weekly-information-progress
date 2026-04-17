@@ -17,6 +17,7 @@ Flow:
        - không có due date             → todo
 """
 
+import time
 import requests
 from datetime import date, datetime, timezone
 from lark_auth import get_user_access_token, get_app_access_token
@@ -31,6 +32,23 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {get_user_access_token()}"}
 
 
+def _get(url: str, headers: dict, params: dict = None, max_retries: int = 5) -> requests.Response:
+    """
+    Wrapper GET với retry tự động khi gặp 429 Too Many Requests.
+    Exponential backoff: 1s → 2s → 4s → 8s → 16s
+    """
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        if resp.status_code != 429:
+            return resp
+        wait = 2 ** attempt
+        print(f"[api] ⏳ Rate limit 429, chờ {wait}s (attempt {attempt+1}/{max_retries})...")
+        time.sleep(wait)
+    # Lần cuối raise luôn
+    resp.raise_for_status()
+    return resp
+
+
 # ── 1. Lấy danh sách tất cả task list ────────────────────────────────────────
 
 def fetch_tasklists() -> list[dict]:
@@ -42,12 +60,7 @@ def fetch_tasklists() -> list[dict]:
         if page_token:
             params["page_token"] = page_token
 
-        resp = requests.get(
-            f"{LARK_API}/task/v2/tasklists",
-            headers=_auth_headers(),
-            params=params,
-            timeout=15,
-        )
+        resp = _get(f"{LARK_API}/task/v2/tasklists", headers=_auth_headers(), params=params)
         resp.raise_for_status()
         body = resp.json()
 
@@ -77,12 +90,7 @@ def fetch_tasks_in_list(tasklist_guid: str) -> list[dict]:
             if page_token:
                 params["page_token"] = page_token
 
-            resp = requests.get(
-                f"{LARK_API}/task/v2/tasklists/{tasklist_guid}/tasks",
-                headers=_auth_headers(),
-                params=params,
-                timeout=15,
-            )
+            resp = _get(f"{LARK_API}/task/v2/tasklists/{tasklist_guid}/tasks", headers=_auth_headers(), params=params)
             resp.raise_for_status()
             body = resp.json()
 
@@ -103,7 +111,6 @@ def fetch_tasks_in_list(tasklist_guid: str) -> list[dict]:
 # ── 3. Lấy sub-tasks của 1 task ───────────────────────────────────────────────
 
 def fetch_subtasks(task_guid: str) -> list[dict]:
-    import time
     all_subtasks = []
     page_token = None
     max_retries = 3
@@ -113,21 +120,7 @@ def fetch_subtasks(task_guid: str) -> list[dict]:
         if page_token:
             params["page_token"] = page_token
 
-        for attempt in range(max_retries):
-            resp = requests.get(
-                f"{LARK_API}/task/v2/tasks/{task_guid}/subtasks",
-                headers=_auth_headers(),
-                params=params,
-                timeout=15,
-            )
-            if resp.status_code == 429:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                print(f"[task] ⏳ Rate limit subtasks, chờ {wait}s...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            break
-
+        resp = _get(f"{LARK_API}/task/v2/tasks/{task_guid}/subtasks", headers=_auth_headers(), params=params)
         body = resp.json()
         if body.get("code") != 0:
             break
@@ -139,7 +132,7 @@ def fetch_subtasks(task_guid: str) -> list[dict]:
         if not data.get("has_more") or not page_token:
             break
 
-        time.sleep(0.2)  # throttle nhẹ giữa các page
+        time.sleep(0.1)  # throttle nhẹ giữa các page
 
     return all_subtasks
 
@@ -161,11 +154,10 @@ def preload_user_names(open_ids: set[str]) -> None:
 
     for uid in ids_to_fetch:
         try:
-            resp = requests.get(
+            resp = _get(
                 f"{LARK_API}/contact/v3/users/{uid}",
                 headers={"Authorization": f"Bearer {token}"},
                 params={"user_id_type": "open_id"},
-                timeout=10,
             )
             body = resp.json()
             if body.get("code") == 0:
