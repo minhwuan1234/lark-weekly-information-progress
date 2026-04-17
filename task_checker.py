@@ -4,13 +4,14 @@ Lấy tất cả task từ Lark Task API v2, lọc các task có start_date ho�
 due_date trong tuần hiện tại, và xác định trạng thái từng task.
 
 Flow:
-  1. GET /task/v2/tasklists          → danh sách tất cả task list của user
-  2. GET /task/v2/tasklists/{guid}/tasks  → task trong từng list (phân trang)
-  3. Lọc task có start hoặc due trong [week_start, week_end]
-  4. Xác định status:
+  1. GET /task/v2/tasklists                    → danh sách tất cả task list
+  2. GET /task/v2/tasklists/{guid}/tasks       → task trong từng list (phân trang)
+  3. GET /task/v2/tasks/{guid}/subtasks        → sub-task của từng task
+  4. Lọc task/sub-task có start hoặc due trong [week_start, week_end]
+  5. Xác định status:
        - completed_at != null           → done
-       - due < now AND not completed    → overdue  (chậm deadline)
-       - due >= now AND not completed   → in_progress
+       - due < today AND not completed  → overdue
+       - due >= today AND not completed → in_progress
        - không có due date             → todo
 """
 
@@ -28,10 +29,6 @@ def _auth_headers() -> dict:
 # ── 1. Lấy danh sách tất cả task list ────────────────────────────────────────
 
 def fetch_tasklists() -> list[dict]:
-    """
-    Trả list[{"guid": ..., "name": ...}].
-    Dùng user_access_token nên chỉ thấy task list của user đó.
-    """
     all_lists = []
     page_token = None
 
@@ -66,143 +63,163 @@ def fetch_tasklists() -> list[dict]:
 # ── 2. Lấy tất cả tasks trong 1 task list ────────────────────────────────────
 
 def fetch_tasks_in_list(tasklist_guid: str) -> list[dict]:
-    """
-    Lấy tất cả tasks trong 1 tasklist (có phân trang).
-    Lấy cả task đã completed và chưa completed.
-    """
     all_tasks = []
-    page_token = None
 
-    while True:
-        params: dict = {
-            "page_size":       50,
-            "completed":       "false",   # lấy task chưa xong trước
-        }
-        if page_token:
-            params["page_token"] = page_token
+    for completed in ("false", "true"):
+        page_token = None
+        while True:
+            params: dict = {"page_size": 50, "completed": completed}
+            if page_token:
+                params["page_token"] = page_token
 
-        resp = requests.get(
-            f"{LARK_API}/task/v2/tasklists/{tasklist_guid}/tasks",
-            headers=_auth_headers(),
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+            resp = requests.get(
+                f"{LARK_API}/task/v2/tasklists/{tasklist_guid}/tasks",
+                headers=_auth_headers(),
+                params=params,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json()
 
-        if body.get("code") != 0:
-            print(f"[task] ⚠️  Bỏ qua tasklist {tasklist_guid}: {body.get('msg')}")
-            return []
+            if body.get("code") != 0:
+                print(f"[task] ⚠️  Bỏ qua tasklist {tasklist_guid}: {body.get('msg')}")
+                break
 
-        data = body.get("data", {})
-        all_tasks.extend(data.get("items", []))
+            data = body.get("data", {})
+            all_tasks.extend(data.get("items", []))
 
-        page_token = data.get("page_token")
-        if not data.get("has_more") or not page_token:
-            break
-
-    # Lấy thêm task đã completed trong tuần
-    page_token = None
-    while True:
-        params = {"page_size": 50, "completed": "true"}
-        if page_token:
-            params["page_token"] = page_token
-
-        resp = requests.get(
-            f"{LARK_API}/task/v2/tasklists/{tasklist_guid}/tasks",
-            headers=_auth_headers(),
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-
-        if body.get("code") != 0:
-            break
-
-        data = body.get("data", {})
-        all_tasks.extend(data.get("items", []))
-
-        page_token = data.get("page_token")
-        if not data.get("has_more") or not page_token:
-            break
+            page_token = data.get("page_token")
+            if not data.get("has_more") or not page_token:
+                break
 
     return all_tasks
 
 
-# ── 3. Parse timestamp từ Lark Task API ──────────────────────────────────────
+# ── 3. Lấy sub-tasks của 1 task ───────────────────────────────────────────────
+
+def fetch_subtasks(task_guid: str) -> list[dict]:
+    """
+    GET /task/v2/tasks/{task_guid}/subtasks
+    Trả về list sub-task (có thể rỗng nếu task không có sub-task).
+    """
+    all_subtasks = []
+    page_token = None
+
+    while True:
+        params: dict = {"page_size": 50}
+        if page_token:
+            params["page_token"] = page_token
+
+        resp = requests.get(
+            f"{LARK_API}/task/v2/tasks/{task_guid}/subtasks",
+            headers=_auth_headers(),
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+        if body.get("code") != 0:
+            # Không có sub-task hoặc lỗi → bỏ qua
+            break
+
+        data = body.get("data", {})
+        all_subtasks.extend(data.get("items", []))
+
+        page_token = data.get("page_token")
+        if not data.get("has_more") or not page_token:
+            break
+
+    return all_subtasks
+
+
+# ── 4. Parse timestamp ────────────────────────────────────────────────────────
 
 def _parse_ts(ts_str: str | None) -> datetime | None:
-    """
-    Lark Task v2 trả timestamp dạng string milliseconds, vd "1711900800000".
-    Chuyển sang datetime (UTC-aware).
-    """
     if not ts_str:
         return None
     try:
-        ts_ms = int(ts_str)
-        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(int(ts_str) / 1000, tz=timezone.utc)
     except (ValueError, TypeError):
         return None
 
 
 def _to_date(ts_str: str | None) -> date | None:
-    """Chuyển timestamp string → date (theo giờ UTC)."""
     dt = _parse_ts(ts_str)
     return dt.date() if dt else None
 
 
-# ── 4. Xác định status ────────────────────────────────────────────────────────
+# ── 5. Xác định status ────────────────────────────────────────────────────────
 
 def _determine_status(task: dict, today: date) -> str:
-    """
-    done      → completed_at có giá trị
-    overdue   → chưa xong + due_date < today
-    in_progress → chưa xong + due_date >= today
-    todo      → chưa xong + không có due_date
-    """
     completed_at = task.get("completed_at")
     if completed_at and completed_at != "0":
         return "done"
 
-    due_obj = task.get("due") or {}
-    due_ts  = due_obj.get("timestamp")
-    due_d   = _to_date(due_ts)
-
+    due_d = _to_date((task.get("due") or {}).get("timestamp"))
     if due_d:
         return "overdue" if due_d < today else "in_progress"
     return "todo"
 
 
-# ── 5. Lấy tên assignee từ task members ──────────────────────────────────────
+# ── 6. Lấy assignee ───────────────────────────────────────────────────────────
 
 def _get_assignees(task: dict) -> str:
-    """
-    Lấy danh sách assignee từ members[].role == 'assignee'.
-    Trả tên hiển thị nếu có, fallback về id.
-    """
     members = task.get("members") or []
-    names = []
-    for m in members:
-        if m.get("role") != "assignee":
-            continue
-        name = (
-            m.get("name")
-            or m.get("display_name")
-            or m.get("id", "")
-        )
-        if name:
-            names.append(name)
-    return ", ".join(names) if names else "Unassigned"
+    names = [
+        m.get("name") or m.get("display_name") or m.get("id", "")
+        for m in members
+        if m.get("role") == "assignee"
+    ]
+    return ", ".join(filter(None, names)) or "Unassigned"
 
 
-# ── 6. Core: lấy tất cả tasks trong tuần từ mọi task list ────────────────────
+# ── 7. Parse 1 task/sub-task thành dict chuẩn ────────────────────────────────
+
+def _parse_task(
+    t: dict,
+    today: date,
+    tasklist_name: str,
+    parent_name: str | None = None,
+) -> dict:
+    """
+    Chuyển raw task API response thành dict chuẩn.
+    parent_name: tên task cha nếu đây là sub-task, None nếu là task thường.
+    """
+    due_d   = _to_date((t.get("due") or {}).get("timestamp"))
+    start_d = _to_date((t.get("start") or {}).get("timestamp"))
+
+    completed_ts = t.get("completed_at")
+    completed_d  = _to_date(completed_ts) if (completed_ts and completed_ts != "0") else None
+
+    task_guid = t.get("guid", "")
+    task_url  = (
+        f"https://applink.larksuite.com/client/todo/detail?guid={task_guid}"
+        if task_guid else ""
+    )
+
+    return {
+        "name":          t.get("summary", "(no name)"),
+        "status":        _determine_status(t, today),
+        "due_date":      due_d,
+        "start_date":    start_d,
+        "assignee":      _get_assignees(t),
+        "tasklist_name": tasklist_name,
+        "task_url":      task_url,
+        "completed_at":  completed_d,
+        "is_subtask":    parent_name is not None,
+        "parent_name":   parent_name,
+    }
+
+
+# ── 8. Core: lấy tất cả tasks + sub-tasks trong tuần ─────────────────────────
 
 def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
     """
-    Lấy tất cả tasks có start_date hoặc due_date trong [week_start, week_end].
+    Lấy tất cả tasks VÀ sub-tasks có start_date hoặc due_date
+    trong [week_start, week_end].
 
-    Trả list[dict]:
+    Mỗi item trả về:
     {
       "name":          str,
       "status":        "done" | "overdue" | "in_progress" | "todo",
@@ -210,18 +227,27 @@ def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
       "start_date":    date | None,
       "assignee":      str,
       "tasklist_name": str,
-      "task_url":      str,        # link mở task trực tiếp trong Lark
+      "task_url":      str,
       "completed_at":  date | None,
+      "is_subtask":    bool,
+      "parent_name":   str | None,   # tên task cha nếu là sub-task
     }
     """
-    today      = date.today()
-    tasklists  = fetch_tasklists()
-    result     = []
+    today     = date.today()
+    tasklists = fetch_tasklists()
+    result    = []
+
+    def _in_week(t: dict) -> bool:
+        due_d   = _to_date((t.get("due") or {}).get("timestamp"))
+        start_d = _to_date((t.get("start") or {}).get("timestamp"))
+        return (
+            (due_d   and week_start <= due_d   <= week_end) or
+            (start_d and week_start <= start_d <= week_end)
+        )
 
     for tl in tasklists:
         tl_guid = tl.get("guid") or tl.get("tasklist_guid", "")
         tl_name = tl.get("name", "Unknown List")
-
         if not tl_guid:
             continue
 
@@ -229,48 +255,34 @@ def get_tasks_for_week(week_start: date, week_end: date) -> list[dict]:
         print(f"[task] '{tl_name}': {len(raw_tasks)} tasks")
 
         for t in raw_tasks:
-            due_obj   = t.get("due") or {}
-            start_obj = t.get("start") or {}
-
-            due_d   = _to_date(due_obj.get("timestamp"))
-            start_d = _to_date(start_obj.get("timestamp"))
-
-            # Chỉ giữ task có start hoặc due trong tuần này
-            in_week = (
-                (due_d   and week_start <= due_d   <= week_end) or
-                (start_d and week_start <= start_d <= week_end)
-            )
-            if not in_week:
-                continue
-
-            status       = _determine_status(t, today)
-            completed_ts = t.get("completed_at")
-            completed_d  = _to_date(completed_ts) if (completed_ts and completed_ts != "0") else None
-
-            # URL task: Lark tự build từ guid
+            task_name = t.get("summary", "(no name)")
             task_guid = t.get("guid", "")
-            task_url  = f"https://applink.larksuite.com/client/todo/detail?guid={task_guid}" if task_guid else ""
 
-            result.append({
-                "name":          t.get("summary", "(no name)"),
-                "status":        status,
-                "due_date":      due_d,
-                "start_date":    start_d,
-                "assignee":      _get_assignees(t),
-                "tasklist_name": tl_name,
-                "task_url":      task_url,
-                "completed_at":  completed_d,
-            })
+            # ── Task cha: add nếu trong tuần ──────────────────────────────
+            if _in_week(t):
+                result.append(_parse_task(t, today, tl_name, parent_name=None))
+
+            # ── Sub-tasks: luôn fetch, add nếu sub-task trong tuần ────────
+            if task_guid:
+                subtasks = fetch_subtasks(task_guid)
+                for st in subtasks:
+                    if _in_week(st):
+                        result.append(_parse_task(st, today, tl_name, parent_name=task_name))
+                        print(f"[task]   └─ Sub-task: {st.get('summary', '')} (parent: {task_name})")
 
     # Sắp xếp: overdue trước, rồi in_progress, todo, done
     order = {"overdue": 0, "in_progress": 1, "todo": 2, "done": 3}
     result.sort(key=lambda t: (order.get(t["status"], 9), t["due_date"] or date.max))
 
+    done_c = sum(1 for t in result if t["status"] == "done")
+    over_c = sum(1 for t in result if t["status"] == "overdue")
+    wip_c  = sum(1 for t in result if t["status"] == "in_progress")
+    todo_c = sum(1 for t in result if t["status"] == "todo")
+    sub_c  = sum(1 for t in result if t["is_subtask"])
+
     print(
         f"\n[task] Tổng {len(result)} tasks trong tuần {week_start} → {week_end}\n"
-        + f"       done={sum(1 for t in result if t['status']=='done')} | "
-        + f"overdue={sum(1 for t in result if t['status']=='overdue')} | "
-        + f"in_progress={sum(1 for t in result if t['status']=='in_progress')} | "
-        + f"todo={sum(1 for t in result if t['status']=='todo')}"
+        f"       done={done_c} | overdue={over_c} | in_progress={wip_c} | todo={todo_c}\n"
+        f"       (trong đó {sub_c} sub-tasks)"
     )
     return result
