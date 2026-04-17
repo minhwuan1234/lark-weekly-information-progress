@@ -6,6 +6,11 @@ Logic màu:
   - Ô có màu + có text  → ô đầu của task (chứa tên, due date)
   - Ô có màu + no text  → task kéo dài từ ô trước (cùng màu, cùng hàng)
   - Ô trắng / no color  → không có task
+
+── Lark Sheets API v2 styles ──────────────────────────────────────────────────
+Endpoint: GET /sheets/v2/spreadsheets/{token}/styles?range=sheetId!A1:BZ60
+Response: data.valueRange.values → list[list[{"style": {"backColor": "#FFCC00", ...}}]]
+backColor là hex string (#RRGGBB). Ô trắng = #FFFFFF hoặc không có backColor.
 """
 
 import os
@@ -15,84 +20,27 @@ from datetime import date
 from typing import Optional
 from lark_auth import get_user_access_token
 
-LARK_API     = "https://open.larksuite.com/open-apis"
-SHEET_TOKEN  = os.environ.get("LARK_SHEET_TOKEN", "EikqsZWIphkIGTtDxQIl6nSkg4f")
-_SHEET_ID_ENV = os.environ.get("LARK_SHEET_ID", "")   # có thể là tên tab hoặc sheet ID thực
-
-
-# ── Auto-discover sheet ID từ tên tab ────────────────────────────────────────
-def get_sheet_id() -> str:
-    """
-    Lark Sheet API cần sheetId dạng mã 6-7 ký tự (vd: '0b4f2c'),
-    không phải tên tab (vd: 'Production').
-
-    Hàm này gọi API lấy danh sách tất cả sheets trong spreadsheet,
-    rồi tìm sheet có title khớp với LARK_SHEET_ID.
-    Nếu LARK_SHEET_ID đã là mã (không có khoảng trắng, ngắn) → dùng luôn.
-    """
-    # Nếu đã là mã ngắn (≤12 ký tự, không có space) → dùng luôn
-    if _SHEET_ID_ENV and len(_SHEET_ID_ENV) <= 12 and " " not in _SHEET_ID_ENV:
-        return _SHEET_ID_ENV
-
-    # Gọi API lấy danh sách sheets
-    resp = requests.get(
-        f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/query",
-        headers={"Authorization": f"Bearer {get_user_access_token()}"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lấy danh sách sheets thất bại: {data}")
-
-    sheets = data.get("data", {}).get("sheets", [])
-
-    # In ra để debug
-    print("[sheet] Danh sách tabs trong spreadsheet:")
-    for s in sheets:
-        print(f"  - title='{s.get('title')}' | sheet_id='{s.get('sheet_id')}'")
-
-    # Tìm theo tên tab
-    target = _SHEET_ID_ENV or "Production"
-    for s in sheets:
-        if s.get("title", "").strip() == target.strip():
-            found_id = s["sheet_id"]
-            print(f"[sheet] Tìm thấy: '{target}' → sheet_id={found_id}")
-            return found_id
-
-    # Không tìm thấy tên khớp → dùng sheet đầu tiên
-    if sheets:
-        fallback = sheets[0]["sheet_id"]
-        print(f"[sheet] ⚠️  Không tìm thấy tab '{target}', dùng sheet đầu tiên: {fallback}")
-        return fallback
-
-    raise RuntimeError("Không tìm thấy sheet nào trong spreadsheet!")
-
-
-# Cache sheet ID để không gọi API nhiều lần
-_sheet_id_cache: str | None = None
-
-def _get_cached_sheet_id() -> str:
-    global _sheet_id_cache
-    if not _sheet_id_cache:
-        _sheet_id_cache = get_sheet_id()
-    return _sheet_id_cache
+LARK_API    = "https://open.larksuite.com/open-apis"
+SHEET_TOKEN = os.environ.get("LARK_SHEET_TOKEN", "EikqsZWIphkIGTtDxQIl6nSkg4f")
+SHEET_ID    = os.environ.get("LARK_SHEET_ID", "Production")   # tên tab (sheetId)
 
 
 # ── 1. Fetch raw data từ Lark Sheets API ─────────────────────────────────────
+
 def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {get_user_access_token()}"}
 
 
 def fetch_values(start_row: int, end_row: int) -> list[list]:
     """Lấy giá trị text của từng ô, trả về list of rows."""
-    sheet_id  = _get_cached_sheet_id()
-    range_str = f"{sheet_id}!A{start_row}:BZ{end_row}"
+    range_str = f"{SHEET_ID}!A{start_row}:BZ{end_row}"
     resp = requests.get(
         f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/values/{range_str}",
         headers=_auth_headers(),
-        params={"valueRenderOption": "ToString", "dateTimeRenderOption": "FormattedString"},
+        params={
+            "valueRenderOption": "ToString",
+            "dateTimeRenderOption": "FormattedString",
+        },
         timeout=15,
     )
     resp.raise_for_status()
@@ -103,13 +51,24 @@ def fetch_values(start_row: int, end_row: int) -> list[list]:
 
 
 def fetch_styles(start_row: int, end_row: int) -> list[list]:
-    """Lấy style (background color) của từng ô."""
-    sheet_id  = _get_cached_sheet_id()
-    range_str = f"{sheet_id}!A{start_row}:BZ{end_row}"
+    """
+    Lấy style (background color) của từng ô qua Sheets API v2 /styles.
+
+    Endpoint: GET /sheets/v2/spreadsheets/{token}/styles
+    Params  : range = "sheetId!A{start}:BZ{end}"   ← singular, không phải "ranges"
+
+    Response (mỗi cell):
+      {"style": {"backColor": "#FFCC00", "bold": false, ...}}
+      hoặc null nếu ô không có style.
+
+    Trả về styles_grid[row][col] = dict {"backColor": ..., ...}
+    (đã bóc lớp "style" ra ngoài để _normalize_color dùng trực tiếp)
+    """
+    range_str = f"{SHEET_ID}!A{start_row}:BZ{end_row}"
     resp = requests.get(
-        f"{LARK_API}/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/{sheet_id}/styles",
+        f"{LARK_API}/sheets/v2/spreadsheets/{SHEET_TOKEN}/styles",
         headers=_auth_headers(),
-        params={"ranges": range_str},
+        params={"range": range_str},   # ← đúng là "range", không phải "ranges"
         timeout=15,
     )
     resp.raise_for_status()
@@ -117,21 +76,25 @@ def fetch_styles(start_row: int, end_row: int) -> list[list]:
     if data.get("code") != 0:
         raise RuntimeError(f"Lấy styles thất bại: {data}")
 
-    # Trả về grid styles[row][col]
+    raw_rows = data.get("data", {}).get("valueRange", {}).get("values", [])
+
+    # Bóc lớp "style" ra → trả list[list[dict]]
+    # mỗi phần tử là style dict (hoặc {} nếu không có style)
     styles_grid: list[list] = []
-    for item in data.get("data", {}).get("styles", []):
-        row_idx = item.get("range", {}).get("rowIndex", 0)
-        col_idx = item.get("range", {}).get("columnIndex", 0)
-        while len(styles_grid) <= row_idx:
-            styles_grid.append([])
-        row = styles_grid[row_idx]
-        while len(row) <= col_idx:
-            row.append(None)
-        row[col_idx] = item.get("style", {})
+    for row in raw_rows:
+        style_row: list = []
+        for cell in (row or []):
+            if isinstance(cell, dict):
+                style_row.append(cell.get("style") or {})
+            else:
+                style_row.append({})
+        styles_grid.append(style_row)
+
     return styles_grid
 
 
 # ── 2. Parse hàng 3 → map col_index → date ───────────────────────────────────
+
 def parse_date_row(row: list) -> dict[int, date]:
     """
     row = list cell values từ hàng 3.
@@ -173,15 +136,46 @@ def _parse_date(text: str, year: int) -> Optional[date]:
 
 
 # ── 3. Normalize màu ô ────────────────────────────────────────────────────────
+
 def _normalize_color(style: Optional[dict]) -> Optional[str]:
     """
-    Lark trả background color dạng:
-      {"background_color": {"red": 0.98, "green": 0.90, "blue": 0.23, "alpha": 1}}
-    Chuyển sang hex. Trả None nếu trắng hoặc không màu.
+    Nhận style dict, trả hex color (#rrggbb) hoặc None nếu trắng/không màu.
+
+    Hỗ trợ 2 format:
+    ┌─────────────────────────────────────────────────────────────┐
+    │ v2 (chính): style = {"backColor": "#FFCC00", ...}          │
+    │ v3 (dự phòng): style = {"background_color":               │
+    │                           {"red": 0.98, "green": 0.9, ...}}│
+    └─────────────────────────────────────────────────────────────┘
     """
     if not style:
         return None
 
+    # ── v2 format: backColor là hex string ───────────────────────────────────
+    back = style.get("backColor", "")
+    if back:
+        back = back.strip()
+        if not back.startswith("#"):
+            back = f"#{back}"
+
+        # Expand shorthand #RGB → #RRGGBB
+        if len(back) == 4:
+            back = f"#{back[1]*2}{back[2]*2}{back[3]*2}"
+
+        try:
+            r = int(back[1:3], 16)
+            g = int(back[3:5], 16)
+            b = int(back[5:7], 16)
+        except (ValueError, IndexError):
+            return None
+
+        # Bỏ qua trắng và gần trắng
+        if r >= 250 and g >= 250 and b >= 250:
+            return None
+
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # ── v3 fallback: background_color là RGBA dict ────────────────────────────
     bg = style.get("background_color") or style.get("bg_color") or {}
     if not bg:
         return None
@@ -190,13 +184,13 @@ def _normalize_color(style: Optional[dict]) -> Optional[str]:
     g = round(bg.get("green", 1.0) * 255)
     b = round(bg.get("blue",  1.0) * 255)
 
-    # Bỏ qua trắng và gần trắng
     if r >= 250 and g >= 250 and b >= 250:
         return None
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ── 4. Parse cell text → tên task + due date ─────────────────────────────────
+
 def _parse_cell_text(text: str) -> tuple[str, Optional[str]]:
     """
     "CSL 6. Forests and Wood Illus ~2' (1.5)\nDue 17/4"
@@ -214,6 +208,7 @@ def _parse_cell_text(text: str) -> tuple[str, Optional[str]]:
 
 
 # ── 5. Core: quét sheet → danh sách task trong tuần ──────────────────────────
+
 def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -> list[dict]:
     """
     Trả list[dict]:
@@ -222,7 +217,7 @@ def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -
       "due":      str | None,
       "assignee": str,
       "color":    str hex,
-      "dates":    list[date],   # các ngày task kéo dài
+      "dates":    list[date],   # các ngày task kéo dài trong tuần
       "row":      int,          # số hàng trong sheet (1-indexed)
     }
     Chỉ trả task có ít nhất 1 ngày nằm trong [week_start, week_end].
@@ -235,14 +230,16 @@ def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -
     if len(values) < 3:
         raise ValueError("Sheet không đủ 3 hàng")
 
-    date_row    = values[2]          # hàng 3, 0-indexed
+    date_row    = values[2]          # hàng 3
     col_to_date = parse_date_row(date_row)
 
     if not col_to_date:
         raise ValueError("Không tìm thấy ngày ở hàng 3 — kiểm tra lại format ô")
 
-    print(f"[sheet] Tìm thấy {len(col_to_date)} cột ngày: "
-          f"{min(col_to_date.values())} → {max(col_to_date.values())}")
+    print(
+        f"[sheet] Tìm thấy {len(col_to_date)} cột ngày: "
+        f"{min(col_to_date.values())} → {max(col_to_date.values())}"
+    )
 
     tasks: list[dict] = []
 
@@ -259,7 +256,6 @@ def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -
         for col_idx in sorted(col_to_date.keys()):
             cell_date  = col_to_date[col_idx]
             cell_text  = str(row_vals[col_idx]).strip() if col_idx < len(row_vals) else ""
-
             cell_style = row_styles[col_idx] if col_idx < len(row_styles) else None
             cell_color = _normalize_color(cell_style)
 
@@ -271,7 +267,7 @@ def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -
                 continue
 
             if current_task and current_task["color"] == cell_color:
-                # Cùng màu → kéo dài task
+                # Cùng màu → task kéo dài
                 current_task["dates"].append(cell_date)
                 # Nếu ô này có text mà task chưa có tên → lấy tên từ đây
                 if cell_text and not current_task["name"]:
@@ -303,6 +299,8 @@ def parse_tasks_for_week(week_start: date, week_end: date, max_rows: int = 60) -
         if any(week_start <= d <= week_end for d in t["dates"])
     ]
 
-    print(f"[sheet] Tổng {len(tasks)} tasks, {len(in_week)} tasks trong tuần "
-          f"{week_start} → {week_end}")
+    print(
+        f"[sheet] Tổng {len(tasks)} tasks, {len(in_week)} tasks trong tuần "
+        f"{week_start} → {week_end}"
+    )
     return in_week
