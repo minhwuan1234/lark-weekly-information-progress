@@ -162,7 +162,7 @@ def preload_user_names(open_ids: set[str]) -> None:
         try:
             resp = requests.get(
                 f"{LARK_API}/contact/v3/users",
-                headers={"Authorization": f"Bearer {get_app_access_token()}"},
+                headers={"Authorization": f"Bearer {get_user_access_token()}"},
                 params=[("user_id_type", "open_id")] + [("user_ids", uid) for uid in batch],
                 timeout=15,
             )
